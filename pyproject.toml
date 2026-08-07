@@ -1,0 +1,9 @@
+[project]
+name = "backtesting-engine"
+version = "0.1.0"
+description = "Event-driven quant backtesting engine built from scratch."
+requires-python = ">=3.11"
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["."]
