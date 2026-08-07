@@ -80,10 +80,61 @@ Write tests for `engine/` components before or alongside implementation, especia
 - Every non-obvious design decision (bias tradeoffs, assumptions) gets a comment
   or a note in README.md, not just buried in code
 
+## Design Decisions
+_(recruiter-facing rationale for non-obvious choices — see also
+data/reference/SOURCES.md for the full point-in-time data writeup)_
+
+### Step 1 — Events + event queue
+- **FIFO queue, not a timestamp-sorted heap.** MarketEvent → Signal → Order →
+  Fill are causally dependent and often share a timestamp. The main loop
+  design (pull one MarketEvent, fully drain everything it cascades into
+  before pulling the next) means insertion order already equals both
+  chronological *and* causal order. A heap would need an arbitrary tiebreaker
+  for same-timestamp events, risking scrambling that causal chain — FIFO is
+  simpler and can't make that mistake. As a backstop against a caller
+  breaking that discipline, `EventQueue.put()` rejects any event timestamped
+  earlier than the most recently dequeued event.
+- **`__post_init__` validation on events** (OHLC consistency, positive
+  quantities, LIMIT orders requiring a price). Not strictly required for a
+  "skeleton," but cheap, and it catches exactly the kind of silent
+  data-corruption bug that produces a backtest that *looks* profitable but
+  is wrong — which is this project's stated failure mode to guard against.
+
+### Step 2 — Data loader + point-in-time universe
+- **Point-in-time S&P 500 membership: vendored free dataset, not a live
+  scrape, not a paid vendor.** Evaluated three options: (a) scrape
+  Wikipedia's "Selected changes" table live at runtime — free but explicitly
+  labeled non-exhaustive by Wikipedia itself, fragile to scrape, and
+  non-reproducible (a backtest's universe could change if the page is edited
+  between runs); (b) vendor a static CSV
+  ([fja05680/sp500](https://github.com/fja05680/sp500), MIT licensed) —
+  free, covers 1996–2026, verified against an independent fact (TSLA added
+  2020-12-21, dataset gets it exactly right), with candidly documented gaps
+  (pre-2001 likely undercounts membership; post-2019 still inherits
+  Wikipedia's incompleteness); (c) a paid vendor (Norgate/Sharadar/CRSP) —
+  institutional-grade but out of scope without sign-off. Chose (b): baked a
+  static parquet snapshot into the repo (reproducibility matters more than
+  freshness for a backtester) with the limitations documented prominently in
+  `data/universe.py`'s module docstring and `data/reference/SOURCES.md`, per
+  the "don't silently pretend it's point-in-time accurate" requirement.
+- **`survivorship_biased` toggle returns *today's* roster regardless of
+  `as_of` when True.** This deliberately reproduces the classic mistake
+  (backtesting 2015 with today's S&P 500 list) so `analytics/` can show the
+  biased vs. accurate equity curves side-by-side later, rather than the
+  toggle being a no-op difference.
+- **`auto_adjust=True` on the yfinance fetch.** Unadjusted closes show a fake
+  ~-75% "crash" at every 4:1 stock split (e.g. AAPL, Aug 2020) — adjusted
+  prices are the only correct default for anything touching price levels.
+- **Cache is coarse-grained (whole-range re-fetch on a miss), not
+  gap-filling.** A request only partially covered by the cache re-fetches
+  its *entire* range rather than just the missing delta. Simpler and can't
+  get multi-gap reconciliation wrong; costs some redundant network calls,
+  acceptable at this project's data volume.
+
 ## Current status
 _(update this section as the project progresses)_
 - [x] Event queue skeleton
-- [ ] Data loader + point-in-time universe
+- [x] Data loader + point-in-time universe
 - [ ] Portfolio + execution
 - [ ] First strategy (SMA crossover) validating full pipeline
 - [ ] Performance analytics
