@@ -131,11 +131,56 @@ data/reference/SOURCES.md for the full point-in-time data writeup)_
   get multi-gap reconciliation wrong; costs some redundant network calls,
   acceptable at this project's data volume.
 
+### Step 3 — Portfolio + execution
+- **Fills happen on the next bar's open, never the bar that produced the
+  order.** A SignalEvent derived from bar T's data cascades into an
+  OrderEvent timestamped T in the same event-queue pass; filling that order
+  against bar T's own close (or open) would mean trading on a price already
+  known when the decision was made — a same-bar fill is look-ahead bias in
+  disguise. `ExecutionHandler` holds every order pending and only fills it
+  against a `MarketEvent` strictly later than the order's own timestamp; the
+  check (`order.timestamp >= market_event.timestamp` → stays pending) is a
+  runtime guard, not just a documented convention, matching the event
+  queue's own approach to invariant enforcement.
+- **Slippage only applies to MARKET fills, never LIMIT fills.** A limit
+  order's entire purpose is a price guarantee; applying slippage to it would
+  contradict that guarantee. Slippage model is fixed-bps-of-price
+  (`FixedBpsSlippage`), pushing MARKET fills against the trader (BUYs fill
+  higher, SELLs fill lower) — the simplest model that's still directionally
+  honest. Commission (`PerTradeCommission`: fixed + optional per-share)
+  applies to every fill regardless of order type.
+- **LIMIT fill logic checks the bar's [low, high] range, not just its
+  open.** A buy limit fills if the bar's low reached the limit price, at
+  `min(open, limit)` — so a gap-down open more favorable than the limit
+  still gives the trader that better price. Orders that never cross stay
+  pending indefinitely rather than being forced to fill.
+- **Long-only, cash account, no margin/leverage — enforced, not just
+  assumed.** `Portfolio` rejects (raises `PortfolioError`) any BUY fill that
+  would take cash negative and any SELL fill that would take a position
+  negative (i.e. shorting). Per project scope, this project does not model
+  margin or short positions unless that's a deliberate future decision, not
+  an accident of missing a check.
+- **Commission is not folded into a position's cost basis.** `avg_cost` is
+  the volume-weighted average *fill price* only; commission reduces cash
+  immediately on every fill and is subtracted again from realized PnL when a
+  position is sold. Keeps "what did I pay for the shares" separate from
+  "what did trading cost me," while total portfolio value still nets out
+  correctly either way.
+- **Equity-curve cadence is the caller's decision, not Portfolio's.**
+  `Portfolio.record_snapshot(timestamp)` must be called explicitly; the
+  class doesn't assume how many symbols or bars constitute "one point in
+  time" for the eventual multi-symbol backtest loop.
+- **Partial fills are explicitly deferred, not silently dropped.** The
+  directory-structure sketch above mentions partial fills as a future
+  `execution.py` capability; this step's orders always fill in full or not
+  at all (LIMIT) / in full (MARKET). Modeling fills limited by a bar's
+  volume is a reasonable later addition, not an oversight.
+
 ## Current status
 _(update this section as the project progresses)_
 - [x] Event queue skeleton
 - [x] Data loader + point-in-time universe
-- [ ] Portfolio + execution
+- [x] Portfolio + execution
 - [ ] First strategy (SMA crossover) validating full pipeline
 - [ ] Performance analytics
 - [ ] Second strategy

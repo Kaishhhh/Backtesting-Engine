@@ -20,23 +20,24 @@ OrderEvent   → Execution simulates → FillEvent
 FillEvent    → Portfolio updates cash/positions
 ```
 
+```
 ├── data/
-│ ├── loader.py # cache-first OHLCV fetching
-│ └── universe.py # point-in-time S&P 500 membership
+│   ├── loader.py       # cache-first OHLCV fetching
+│   └── universe.py     # point-in-time S&P 500 membership
 ├── engine/
-│ ├── events.py # MarketEvent, SignalEvent, OrderEvent, FillEvent
-│ ├── event_queue.py # FIFO queue enforcing chronological order
-│ ├── portfolio.py # cash accounting, positions, PnL, equity curve
-│ └── execution.py # fill simulation: slippage, commissions
+│   ├── events.py        # MarketEvent, SignalEvent, OrderEvent, FillEvent
+│   ├── event_queue.py   # FIFO queue enforcing chronological order
+│   ├── portfolio.py     # cash accounting, positions, PnL, equity curve
+│   └── execution.py     # fill simulation: slippage, commissions
 ├── strategies/
-│ ├── base.py # abstract Strategy interface
-│ └── ... # one file per strategy
+│   ├── base.py           # abstract Strategy interface
+│   └── ...                # one file per strategy
 ├── analytics/
-│ └── performance.py # Sharpe, Sortino, max drawdown, tearsheet
+│   └── performance.py    # Sharpe, Sortino, max drawdown, tearsheet
 ├── validation/
-│ └── walk_forward.py # walk-forward train/test harness
-└── tests/ # unit tests for every module above
-
+│   └── walk_forward.py   # walk-forward train/test harness
+└── tests/                 # unit tests for every module above
+```
 
 ## Setup
 
@@ -55,7 +56,7 @@ on — each stage below was its own commit.
       order enforced at runtime (`EventQueueError` on out-of-order `put()`)
 - [x] **2. Data loader + point-in-time universe** — cache-first market data,
       point-in-time index membership with a survivorship-bias toggle
-- [ ] **3. Portfolio + execution** — cash accounting, position tracking,
+- [x] **3. Portfolio + execution** — cash accounting, position tracking,
       slippage/commission simulation, next-bar-open fills
 - [ ] **4. First strategy (SMA crossover)** — validates the full pipeline
       end-to-end on real data
@@ -93,6 +94,17 @@ backtester that are easy to get subtly wrong:
   vendored dataset was spot-checked against a known fact (TSLA joined the
   S&P 500 on 2020-12-21) before being trusted. Full tradeoff analysis in
   `data/reference/SOURCES.md`.
+- **Fills happen on the next bar's open, never the bar that produced the
+  order.** A same-bar fill would mean trading on a price already known when
+  the decision was made — look-ahead bias in disguise. `ExecutionHandler`
+  enforces this at runtime (an order timestamped the same as or after the
+  incoming bar stays pending) rather than trusting callers to sequence
+  things correctly.
+- **Long-only, cash account, no margin/leverage — enforced, not assumed.**
+  `Portfolio` raises rather than silently allowing a BUY that would take
+  cash negative or a SELL that would take a position negative (shorting).
+  Modeling margin/shorting is a deliberate future scope decision, not a
+  missing guardrail.
 
 ## ⚠️ Data sources and known limitations
 
