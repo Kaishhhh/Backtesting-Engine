@@ -6,7 +6,7 @@ from datetime import datetime, timedelta
 
 import pytest
 
-from engine.events import FillEvent, MarketEvent
+from engine.events import FillEvent, MarketEvent, SignalEvent
 from engine.portfolio import Portfolio, PortfolioError
 
 T0 = datetime(2024, 1, 2, 9, 30)
@@ -26,6 +26,13 @@ def bar(ts, close, symbol="AAPL", open_=None) -> MarketEvent:
     return MarketEvent(
         timestamp=ts, symbol=symbol, open=o, high=max(o, close) + 1,
         low=min(o, close) - 1, close=close, volume=1_000,
+    )
+
+
+def signal(ts, direction, symbol="AAPL", strength=1.0, strategy_id="test") -> SignalEvent:
+    return SignalEvent(
+        timestamp=ts, symbol=symbol, direction=direction,
+        strategy_id=strategy_id, strength=strength,
     )
 
 
@@ -193,3 +200,102 @@ class TestSnapshotAndEquityCurve:
 
         portfolio.on_fill(fill(T1, "SELL", quantity=10, price=110.0, commission=0.0, symbol="AAPL"))
         assert portfolio.total_realized_pnl() == pytest.approx((110 - 100) * 10)
+
+
+class TestPositionSizePctValidation:
+    def test_default_is_point_nine_five(self):
+        assert Portfolio(initial_cash=10_000).position_size_pct == pytest.approx(0.95)
+
+    def test_boundary_of_one_is_accepted(self):
+        assert Portfolio(initial_cash=10_000, position_size_pct=1.0).position_size_pct == 1.0
+
+    def test_zero_is_rejected(self):
+        with pytest.raises(ValueError):
+            Portfolio(initial_cash=10_000, position_size_pct=0.0)
+
+    def test_above_one_is_rejected(self):
+        with pytest.raises(ValueError):
+            Portfolio(initial_cash=10_000, position_size_pct=1.5)
+
+
+class TestGenerateOrder:
+    def test_long_sizes_using_cash_position_size_pct_and_price(self):
+        portfolio = Portfolio(initial_cash=10_000)  # position_size_pct=0.95
+        portfolio.update_market_price(bar(T0, close=100.0))
+
+        order = portfolio.generate_order(signal(T0, "LONG"))
+
+        assert order is not None
+        assert order.direction == "BUY"
+        assert order.order_type == "MARKET"
+        assert order.symbol == "AAPL"
+        assert order.timestamp == T0
+        assert order.quantity == 95  # int(10_000 * 0.95 / 100)
+
+    def test_long_sizing_scales_with_signal_strength(self):
+        portfolio = Portfolio(initial_cash=10_000)
+        portfolio.update_market_price(bar(T0, close=100.0))
+
+        order = portfolio.generate_order(signal(T0, "LONG", strength=0.5))
+
+        assert order.quantity == 47  # int(10_000 * 0.95 * 0.5 / 100)
+
+    def test_long_while_already_holding_is_a_noop(self):
+        portfolio = Portfolio(initial_cash=10_000)
+        portfolio.on_fill(fill(T0, "BUY", quantity=5, price=100.0))
+        portfolio.update_market_price(bar(T0, close=100.0))
+
+        assert portfolio.generate_order(signal(T0, "LONG")) is None
+
+    def test_long_after_a_full_round_trip_is_allowed_again(self):
+        # Position dict entry survives a full sell at quantity=0 -- the
+        # "already holding" check must use quantity, not dict membership.
+        portfolio = Portfolio(initial_cash=10_000)
+        portfolio.on_fill(fill(T0, "BUY", quantity=5, price=100.0))
+        portfolio.on_fill(fill(T1, "SELL", quantity=5, price=100.0))
+        assert "AAPL" in portfolio.positions  # entry still present, quantity 0
+        portfolio.update_market_price(bar(T1, close=100.0))
+
+        order = portfolio.generate_order(signal(T1, "LONG"))
+        assert order is not None
+        assert order.direction == "BUY"
+
+    def test_long_with_insufficient_cash_for_even_one_share_returns_none(self):
+        portfolio = Portfolio(initial_cash=1.0)
+        portfolio.update_market_price(bar(T0, close=100.0))
+
+        assert portfolio.generate_order(signal(T0, "LONG")) is None
+
+    def test_long_with_no_known_price_raises(self):
+        portfolio = Portfolio(initial_cash=10_000)
+        with pytest.raises(PortfolioError):
+            portfolio.generate_order(signal(T0, "LONG"))
+
+    def test_exit_with_no_position_is_a_noop(self):
+        portfolio = Portfolio(initial_cash=10_000)
+        assert portfolio.generate_order(signal(T0, "EXIT")) is None
+
+    def test_exit_after_a_full_round_trip_is_a_noop(self):
+        portfolio = Portfolio(initial_cash=10_000)
+        portfolio.on_fill(fill(T0, "BUY", quantity=5, price=100.0))
+        portfolio.on_fill(fill(T1, "SELL", quantity=5, price=100.0))
+
+        assert portfolio.generate_order(signal(T1, "EXIT")) is None
+
+    def test_exit_while_holding_sells_entire_position(self):
+        portfolio = Portfolio(initial_cash=10_000)
+        portfolio.on_fill(fill(T0, "BUY", quantity=7, price=100.0))
+
+        order = portfolio.generate_order(signal(T1, "EXIT"))
+
+        assert order is not None
+        assert order.direction == "SELL"
+        assert order.quantity == 7
+        assert order.order_type == "MARKET"
+
+    def test_short_signal_raises_portfolio_error(self):
+        portfolio = Portfolio(initial_cash=10_000)
+        portfolio.update_market_price(bar(T0, close=100.0))
+
+        with pytest.raises(PortfolioError):
+            portfolio.generate_order(signal(T0, "SHORT"))

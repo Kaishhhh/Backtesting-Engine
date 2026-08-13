@@ -176,12 +176,69 @@ data/reference/SOURCES.md for the full point-in-time data writeup)_
   at all (LIMIT) / in full (MARKET). Modeling fills limited by a bar's
   volume is a reasonable later addition, not an oversight.
 
+### Step 4 — SMA crossover strategy + end-to-end pipeline
+- **Strategy state is a fixed-size rolling window, never a stored
+  history.** `SMACrossoverStrategy` keeps a per-symbol
+  `collections.deque(maxlen=slow_window)` of closes and recomputes both
+  SMAs from it on every bar; there is no DataFrame of "everything seen so
+  far" anywhere. This isn't just an implementation convenience — it's the
+  mechanism that makes `Strategy.on_market_event(event: MarketEvent) ->
+  SignalEvent | None` a real no-look-ahead boundary rather than a
+  convention: the interface physically cannot hand a strategy more than one
+  bar at a time, so any "memory" it has must be built the same way a live,
+  streaming strategy would have to build it. No signal is emitted until the
+  deque is full (no garbage from an undersized window), and — more subtly —
+  no signal is emitted on the very bar the window *first* becomes full
+  either: that bar only establishes a baseline fast-vs-slow relationship,
+  not an observed crossover, and trading on it would mean acting on trend
+  history from before the strategy started watching.
+- **Signal-to-order sizing landed on `Portfolio.generate_order()`, closing
+  a real gap in Steps 1-3.** The architecture diagram always said
+  "SignalEvent → Portfolio sizes into → OrderEvent," but no such method
+  existed until this step — sizing needs cash/position state, which only
+  `Portfolio` owns, so it couldn't reasonably live on the stateless
+  `Strategy` side. New `Portfolio(initial_cash, position_size_pct=0.95)`
+  param sizes LONG orders as `cash * position_size_pct *
+  signal.strength / latest_close`. Using the current bar's close to *size*
+  an order is not a look-ahead violation (it's already-observed data at
+  decision time) — the actual fill still happens at a later, unknown price
+  via `ExecutionHandler`'s existing next-bar-open mechanism. The 0.95
+  default leaves headroom for slippage/commission/ordinary price movement
+  between the signal bar's close and the fill bar's open, but that headroom
+  isn't a guarantee: a large enough gap can still make `on_fill` raise
+  `PortfolioError` for insufficient cash, and that's allowed to propagate
+  out of the backtest loop uncaught rather than being silently clamped —
+  consistent with this project's fail-loud philosophy elsewhere.
+- **No pyramiding, no double-exit, SHORT signals raise.** A LONG signal
+  while already holding a position (`quantity > 0`, not mere dict
+  membership — a fully-sold `Position` stays in `Portfolio.positions` with
+  `quantity == 0`) is a no-op; likewise EXIT while flat. A `SHORT` signal
+  reaching `generate_order` raises `PortfolioError` rather than being
+  silently ignored, matching `_apply_buy`/`_apply_sell`'s existing
+  philosophy that long-only invariant violations should fail loudly, since
+  a SHORT here means either a misconfigured strategy or a real bug.
+- **The runner's fill-before-strategy ordering within a bar is load-bearing,
+  not incidental.** `engine/runner.py`'s `run_backtest` processes a bar's
+  `MARKET` event by resolving pending fills first (`queue.put()` any
+  resulting `FillEvent`s), *then* updating the mark price, *then* calling
+  the strategy. Because `EventQueue` is strict FIFO, this guarantees a
+  same-bar fill (from an order placed on the prior bar) is applied to
+  `Portfolio` before that same bar's new signal reaches
+  `generate_order()`'s "already holding?" check — reversing the order would
+  let sizing act on stale, pre-fill state.
+- **Validation run**: AAPL, 2015-01-01 to 2024-12-31, SMA(20, 50),
+  $100,000 initial cash (see `main.py`'s docstring for the "why this
+  symbol/range" rationale — a decade spanning multiple regimes, not
+  cherry-picked). Ran clean end-to-end: 2,516 bars, 55 fills (27 round
+  trips), ending value $341,072.22 (+241.07%). This is a pipeline
+  correctness check, not a claim of strategy alpha.
+
 ## Current status
 _(update this section as the project progresses)_
 - [x] Event queue skeleton
 - [x] Data loader + point-in-time universe
 - [x] Portfolio + execution
-- [ ] First strategy (SMA crossover) validating full pipeline
+- [x] First strategy (SMA crossover) validating full pipeline
 - [ ] Performance analytics
 - [ ] Second strategy
 - [ ] Walk-forward validation

@@ -13,6 +13,21 @@ reduces cash immediately on every fill (buy or sell), and is subtracted
 again from realized PnL at the moment a position is sold. This keeps
 avg_cost a pure "what did I pay for the shares" number while commission's
 drag on performance still shows up in both cash and realized PnL.
+
+Signal-to-order sizing (generate_order): Portfolio, not Strategy, decides
+order size -- SignalEvent deliberately carries no quantity (see its
+docstring in events.py). Sizing uses the latest known close purely as an
+*estimate* to compute a share count; that close is already-observed data at
+the time the signal fires, so this is not a look-ahead violation -- the
+actual fill still happens at a later, unknown price via ExecutionHandler's
+next-bar-open mechanism. position_size_pct defaults to 0.95, not 1.0,
+specifically to leave headroom for slippage/commission/ordinary price
+movement between the signal bar's close and the fill bar's open. That
+headroom is not a guarantee: a large enough gap (e.g. an earnings surprise)
+can still exceed it, in which case on_fill's cash check raises
+PortfolioError, uncaught, out of the backtest loop. That's intentional --
+this project fails loudly on invariant violations rather than silently
+clamping order size to whatever cash happens to be left at fill time.
 """
 
 from __future__ import annotations
@@ -20,14 +35,16 @@ from __future__ import annotations
 from dataclasses import dataclass
 from datetime import datetime
 
-from engine.events import FillEvent, MarketEvent
+from engine.events import FillEvent, MarketEvent, OrderEvent, SignalEvent
 
 _CASH_EPSILON = 1e-9  # tolerance for floating-point noise, not a leverage allowance
 
 
 class PortfolioError(RuntimeError):
     """Raised when applying a fill would violate the long-only, no-margin
-    invariant, or when portfolio state is queried before it can be answered."""
+    invariant, when portfolio state is queried before it can be answered,
+    or when a SignalEvent asks for something the long-only model can't
+    represent (a SHORT direction)."""
 
 
 @dataclass
@@ -50,10 +67,15 @@ class PortfolioSnapshot:
 
 
 class Portfolio:
-    def __init__(self, initial_cash: float) -> None:
+    def __init__(self, initial_cash: float, position_size_pct: float = 0.95) -> None:
         if initial_cash < 0:
             raise ValueError(f"initial_cash ({initial_cash}) cannot be negative")
+        if not (0 < position_size_pct <= 1):
+            raise ValueError(
+                f"position_size_pct ({position_size_pct}) must be in (0, 1]"
+            )
         self.cash = initial_cash
+        self.position_size_pct = position_size_pct
         self.positions: dict[str, Position] = {}
         self.trade_log: list[FillEvent] = []
         self.equity_curve: list[PortfolioSnapshot] = []
@@ -102,6 +124,49 @@ class Portfolio:
         if position.quantity == 0:
             position.avg_cost = 0.0
         self.cash += proceeds
+
+    def generate_order(self, signal: SignalEvent) -> OrderEvent | None:
+        """Size a SignalEvent into a MARKET OrderEvent, or None if there's
+        nothing to do (already positioned per a LONG, or flat per an EXIT).
+
+        SHORT signals raise PortfolioError rather than being silently
+        ignored: this portfolio is long-only, so a SHORT reaching here means
+        a misconfigured strategy or a real bug, not a no-op.
+        """
+        if signal.direction == "SHORT":
+            raise PortfolioError(
+                f"received a SHORT signal for {signal.symbol}, but this "
+                f"Portfolio is long-only and does not support shorting."
+            )
+
+        position = self.positions.get(signal.symbol)
+        held = position.quantity if position is not None else 0
+
+        if signal.direction == "LONG":
+            if held > 0:
+                return None
+            price = self._price_for(signal.symbol)
+            quantity = int(self.cash * self.position_size_pct * signal.strength / price)
+            if quantity <= 0:
+                return None
+            return OrderEvent(
+                timestamp=signal.timestamp,
+                symbol=signal.symbol,
+                order_type="MARKET",
+                quantity=quantity,
+                direction="BUY",
+            )
+
+        # EXIT
+        if held <= 0:
+            return None
+        return OrderEvent(
+            timestamp=signal.timestamp,
+            symbol=signal.symbol,
+            order_type="MARKET",
+            quantity=held,
+            direction="SELL",
+        )
 
     def _price_for(self, symbol: str) -> float:
         price = self._latest_prices.get(symbol)

@@ -27,15 +27,17 @@ FillEvent    → Portfolio updates cash/positions
 ├── engine/
 │   ├── events.py        # MarketEvent, SignalEvent, OrderEvent, FillEvent
 │   ├── event_queue.py   # FIFO queue enforcing chronological order
-│   ├── portfolio.py     # cash accounting, positions, PnL, equity curve
-│   └── execution.py     # fill simulation: slippage, commissions
+│   ├── portfolio.py     # cash accounting, positions, PnL, equity curve, sizing
+│   ├── execution.py     # fill simulation: slippage, commissions
+│   └── runner.py        # per-bar event-drain loop wiring it all together
 ├── strategies/
 │   ├── base.py           # abstract Strategy interface
-│   └── ...                # one file per strategy
+│   └── sma_crossover.py  # dual SMA crossover (Step 4 validation strategy)
 ├── analytics/
 │   └── performance.py    # Sharpe, Sortino, max drawdown, tearsheet
 ├── validation/
 │   └── walk_forward.py   # walk-forward train/test harness
+├── main.py                # end-to-end run: real data through the pipeline
 └── tests/                 # unit tests for every module above
 ```
 
@@ -45,6 +47,8 @@ python -m venv .venv
 .venv/Scripts/activate # Windows
 pip install -e ".[dev]"
 pytest
+
+python main.py  # runs the SMA crossover strategy on AAPL, 2015-2024
 
 
 ## Build order / status
@@ -58,7 +62,7 @@ on — each stage below was its own commit.
       point-in-time index membership with a survivorship-bias toggle
 - [x] **3. Portfolio + execution** — cash accounting, position tracking,
       slippage/commission simulation, next-bar-open fills
-- [ ] **4. First strategy (SMA crossover)** — validates the full pipeline
+- [x] **4. First strategy (SMA crossover)** — validates the full pipeline
       end-to-end on real data
 - [ ] **5. Performance analytics** — Sharpe, Sortino, drawdown, tearsheet;
       also where the survivorship-bias toggle gets demonstrated side-by-side
@@ -105,6 +109,14 @@ backtester that are easy to get subtly wrong:
   cash negative or a SELL that would take a position negative (shorting).
   Modeling margin/shorting is a deliberate future scope decision, not a
   missing guardrail.
+- **Strategies see one bar at a time, by construction.**
+  `Strategy.on_market_event(event: MarketEvent) -> SignalEvent | None` has
+  no back-channel to history or future bars — `SMACrossoverStrategy` keeps
+  its own fixed-size rolling window per symbol instead of a stored
+  DataFrame, the same constraint a live/streaming strategy would face. It
+  also withholds a signal on the very bar its window first becomes full,
+  since that bar only establishes a baseline state, not an observed
+  crossover.
 
 ## ⚠️ Data sources and known limitations
 
