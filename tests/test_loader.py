@@ -5,13 +5,13 @@ these tests never touch the network -- loader.py factors that call out into
 its own function specifically so it can be swapped out like this.
 """
 
-from datetime import date
+from datetime import date, datetime, time
 
 import pandas as pd
 import pytest
 
 from data import loader
-from data.loader import SCHEMA_COLUMNS, LoaderError, load_ohlcv
+from data.loader import SCHEMA_COLUMNS, LoaderError, load_market_events, load_ohlcv
 
 
 def make_ohlcv(symbol: str, start: date, end: date) -> pd.DataFrame:
@@ -148,3 +148,72 @@ class TestFetchOhlcvNormalization:
         monkeypatch.setattr(loader.yf, "download", lambda *a, **k: pd.DataFrame())
         with pytest.raises(LoaderError):
             loader.fetch_ohlcv("NOPE", date(2023, 1, 3), date(2023, 1, 5))
+
+
+class TestAdjustmentNoiseClamp:
+    """auto_adjust occasionally leaves close/open a hair outside [low, high]
+    -- observed for real on ADP, CAG, UNM, ABT, and AMGN while building the
+    Step 5 multi-symbol backtest (see data/loader.py's docstring note above
+    _OHLC_NOISE_TOLERANCE). This exercises fetch_ohlcv's real clamp against
+    a contrived MultiIndex response shaped like actual yfinance output."""
+
+    @staticmethod
+    def _download(close_second_day: float):
+        idx = pd.date_range("2023-01-03", "2023-01-04", freq="D")
+        idx.name = "Date"
+        raw = pd.DataFrame(
+            {
+                ("Open", "AAPL"): [1.0, 2.0],
+                ("High", "AAPL"): [1.5, 2.5],
+                ("Low", "AAPL"): [0.5, 1.5],
+                ("Close", "AAPL"): [1.2, close_second_day],
+                ("Volume", "AAPL"): [100, 200],
+            },
+            index=idx,
+        )
+        raw.columns = pd.MultiIndex.from_tuples(raw.columns, names=["Price", "Ticker"])
+        return lambda *a, **k: raw
+
+    def test_close_a_hair_above_high_is_clamped_to_high(self, monkeypatch):
+        monkeypatch.setattr(loader.yf, "download", self._download(close_second_day=2.5000000001))
+        result = loader.fetch_ohlcv("AAPL", date(2023, 1, 3), date(2023, 1, 4))
+        assert result["close"].iloc[1] == 2.5
+
+    def test_close_a_hair_below_low_is_clamped_to_low(self, monkeypatch):
+        monkeypatch.setattr(loader.yf, "download", self._download(close_second_day=1.4999999999))
+        result = loader.fetch_ohlcv("AAPL", date(2023, 1, 3), date(2023, 1, 4))
+        assert result["close"].iloc[1] == 1.5
+
+    def test_violation_beyond_tolerance_is_left_untouched(self, monkeypatch):
+        # A whole dollar outside [low, high] is a real data problem, not
+        # adjustment noise -- must NOT be silently clamped away.
+        monkeypatch.setattr(loader.yf, "download", self._download(close_second_day=10.0))
+        result = loader.fetch_ohlcv("AAPL", date(2023, 1, 3), date(2023, 1, 4))
+        assert result["close"].iloc[1] == 10.0
+
+
+class TestLoadMarketEvents:
+    def test_converts_every_row_to_a_market_event(self, tmp_path, spy):
+        events = load_market_events("AAPL", "2023-01-01", "2023-01-03", cache_dir=tmp_path)
+
+        assert len(events) == 3
+        first = events[0]
+        assert first.symbol == "AAPL"
+        assert first.timestamp == datetime(2023, 1, 1, 9, 30)  # default bar_time
+        assert first.open == pytest.approx(100.0)
+        assert first.high == pytest.approx(101.0)
+        assert first.low == pytest.approx(99.0)
+        assert first.close == pytest.approx(100.5)
+        assert first.volume == 1_000
+        assert isinstance(first.volume, int)
+
+    def test_events_are_in_chronological_order(self, tmp_path, spy):
+        events = load_market_events("AAPL", "2023-01-01", "2023-01-05", cache_dir=tmp_path)
+        timestamps = [e.timestamp for e in events]
+        assert timestamps == sorted(timestamps)
+
+    def test_custom_bar_time_is_honored(self, tmp_path, spy):
+        events = load_market_events(
+            "AAPL", "2023-01-01", "2023-01-01", bar_time=time(16, 0), cache_dir=tmp_path
+        )
+        assert events[0].timestamp == datetime(2023, 1, 1, 16, 0)

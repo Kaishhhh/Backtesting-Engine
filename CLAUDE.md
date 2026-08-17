@@ -233,12 +233,133 @@ data/reference/SOURCES.md for the full point-in-time data writeup)_
   trips), ending value $341,072.22 (+241.07%). This is a pipeline
   correctness check, not a claim of strategy alpha.
 
+### Step 5 — Performance analytics + survivorship bias comparison
+- **Annualization/risk-free-rate assumptions are named constants, not magic
+  numbers.** `analytics/performance.py` defines `TRADING_DAYS_PER_YEAR = 252`,
+  `CALENDAR_DAYS_PER_YEAR = 365.25` (used for CAGR's elapsed-time calc, via
+  `total_seconds()` rather than `.days` so a multi-year span isn't biased by
+  truncating the sub-day remainder), and `DEFAULT_RISK_FREE_RATE = 0.0`.
+- **Sharpe/Sortino's zero-denominator case returns a named constant
+  (`UNDEFINED_RATIO_FALLBACK = 0.0`), not `inf`/`NaN`/an exception.** This
+  covers three situations identically: too few return periods to measure
+  volatility at all, a genuinely flat equity curve (zero volatility), and —
+  Sortino only — zero downside deviation (no losing periods). All three mean
+  "this data can't support a risk-adjusted answer," and `0.0` is the honest
+  way to say that rather than claiming a number the data doesn't justify.
+  Tests cover this as a *distinct* code path from "the real calculation
+  happens to equal zero" (e.g. returns `[+0.01, -0.01]` has nonzero
+  volatility and a genuine 0 mean, exercising actual division; a flat curve
+  short-circuits on zero volatility instead).
+- **Round-trip win/loss logic didn't exist before this step — it was built
+  from scratch, not reused.** Step 4's "27 round trips" print was a naive
+  `len(trade_log) // 2` fill count, not a real BUY/SELL matcher (confirmed
+  by grep before writing anything). `extract_round_trips()` does genuine
+  FIFO lot-matching per symbol (a `deque` of open BUY lots; a SELL consumes
+  the oldest lot(s) first, splitting into multiple `RoundTrip`s on a partial
+  match), general enough for a future strategy that buys in multiple
+  tranches. Each `RoundTrip.pnl` nets out *both* entry and exit commission —
+  deliberately more conservative than `Position.realized_pnl`'s running
+  total, which only nets the sell-side commission (buy-side commission
+  already reduced cash at entry without being logged against "realized"
+  PnL there). Both are correct; they answer different questions. `main.py`
+  now uses this real matcher instead of the naive estimate — for the same
+  AAPL/2015-2024 run, it happens to also land on 27, confirming the
+  heuristic wasn't actually wrong for this specific always-single-position
+  strategy, just uninformative for anything that partially fills.
+- **Survivorship-bias gap, flagged to the user before writing any
+  comparison code, per their explicit request.** The single-symbol AAPL
+  backtest never touches `data/universe.py` at all (AAPL survived, so
+  toggling the flag on it alone shows a trivial 0% difference) — this was
+  surfaced explicitly rather than silently building a comparison that
+  couldn't demonstrate anything. Presented three options (full concurrent
+  multi-symbol engine rework; membership-list-only diff with no P&L; or
+  independent single-symbol backtests summed into an aggregate curve); the
+  user picked the third. `compare_survivorship.py` runs a curated 20-ticker
+  pool (12 survivors + 8 real 2015 constituents later dropped from the
+  index, including `BBBY`'s real 2023 bankruptcy) through the *unmodified*
+  `run_backtest()` independently per symbol — no changes needed to
+  `engine/runner.py` or `Portfolio`'s sizing — then sums the resulting
+  equity curves. **Result on the real data**: the biased (today's-roster)
+  universe shows +88.89% total return vs. the accurate (point-in-time)
+  universe's +50.13% — a textbook demonstration that excluding
+  since-dropped constituents inflates apparent performance, not just a
+  membership-count difference.
+- **yfinance has no usable data at all for most acquired/delisted
+  tickers — a second, separate limitation from the universe-membership
+  one, verified directly rather than assumed.** `CELG`, `CERN`, `BCR`,
+  `AGN`, `DNB`, `RTN`, `MON` (all real 2015 S&P 500 constituents later
+  removed by M&A) each returned "possibly delisted; no data found." The
+  20-ticker comparison pool was chosen only from names checked to actually
+  have data, documented in `compare_survivorship.py`'s module docstring as
+  a scope/data-availability tradeoff, not a claim of index-wide
+  representativeness.
+- **Forward-fill when aggregating per-symbol equity curves of different
+  lengths.** Two pool members (`TWX`, `COL`) have real M&A-truncated data
+  (acquired mid-backtest, no bars afterward). Naively summing per-symbol
+  curves by matching timestamp would silently drop their entire value from
+  the aggregate for every date after their last bar, understating the
+  accurate universe's result. `_aggregate_curves()` reindexes every
+  symbol's (cash, positions_value) series to the full union of trading
+  dates and forward-fills before summing, so a delisted symbol's last known
+  value persists flat instead of vanishing — documented as a
+  simplification (it does not model the real cash/stock payout an actual
+  M&A would deliver), not silently assumed away.
+- **A per-symbol `PortfolioError` in the multi-name comparison is caught
+  and the symbol's contribution is frozen, rather than aborting the whole
+  run.** Splitting $100k across up to 20 names (vs. `main.py`'s single
+  full-size position) shrinks each symbol's absolute cash buffer under
+  `generate_order`'s 0.95 headroom, making the Step 4-documented "large gap
+  exceeds headroom" residual risk considerably more likely to actually
+  fire — and it did, for real, on `BBBY`, `COL`, and `UNM`. One name's gap
+  risk failing shouldn't invalidate a 20-name comparison, so `_run_one()`
+  catches `PortfolioError` and returns whatever equity curve/trade log had
+  already accumulated, letting the same forward-fill aggregation treat it
+  identically to `TWX`/`COL`'s data-truncation case. `engine/runner.py`
+  itself is untouched — this is a caller-level decision specific to running
+  many independent backtests, not a change to the engine's fail-loud
+  philosophy (a single-symbol run via `main.py` still lets the error
+  propagate uncaught).
+- **Found and fixed: `auto_adjust` occasionally produces an open/close a
+  hair outside `[low, high]`.** Discovered for real (not hypothetically)
+  while building this step: e.g. `ADP` on 2018-10-30 came back with
+  `close=115.84330749511719` against `high=115.84330749511717` (a ~2e-14
+  gap), and other symbol/dates were off by as much as ~7.6e-6 — floating-
+  point noise in the adjustment arithmetic, not a real OHLC inconsistency,
+  and confirmed to vary slightly between separate fetches of the identical
+  `[symbol, date]`. `data/loader.py` now clamps `open`/`close` back onto
+  the `[low, high]` boundary when the gap is within a `$0.01` tolerance
+  (~1000x the largest gap observed) — anything larger is left untouched
+  and still raises via `MarketEvent.__post_init__`, since that's a real
+  data problem worth seeing, not noise to hide.
+- **Known, unfixed limitation surfaced during the above investigation:
+  `load_ohlcv`'s cache-hit check effectively never hits for a `start` date
+  that falls on a non-trading day (e.g. any "YYYY-01-01" — New Year's Day
+  is always a market holiday), since the cache's recorded start is the
+  first actual *trading* day, which is always after the requested calendar
+  start.** This means both `main.py` and `compare_survivorship.py`
+  silently do a full live re-fetch on every single run rather than reading
+  the cache, which is what surfaced the adjustment-noise variability above
+  in the first place. This is a latent gap in Step 2's (already-committed,
+  already-documented-as-a-tradeoff) coarse-grained caching design, not
+  something introduced by this step. Deliberately **not** fixed here —
+  it's a Step 2 concern, not a Step 5 one, and fixing it well means
+  distinguishing "genuinely uncached" from "cached, just starts on a
+  holiday" without a trading-calendar dependency. Flagged here so it isn't
+  silently lost; worth a dedicated pass later.
+- **Validation runs**: `main.py` (AAPL, unchanged parameters) still ends
+  around $341k/+241% (exact cents vary run-to-run now that the caching gap
+  above means every run re-fetches — see that note). `compare_survivorship.py`
+  (AS_OF=2015-01-01, same SMA(20,50)/$100k as `main.py`): accurate universe
+  +50.13% (CAGR 4.15%, Sharpe 0.44, max drawdown -18.20%) vs. biased
+  universe +88.89% (CAGR 6.57%, Sharpe 0.60, max drawdown -21.08%) — see
+  chat history for full side-by-side tearsheets.
+
 ## Current status
 _(update this section as the project progresses)_
 - [x] Event queue skeleton
 - [x] Data loader + point-in-time universe
 - [x] Portfolio + execution
 - [x] First strategy (SMA crossover) validating full pipeline
-- [ ] Performance analytics
+- [x] Performance analytics
 - [ ] Second strategy
 - [ ] Walk-forward validation

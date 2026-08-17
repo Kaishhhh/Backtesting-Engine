@@ -23,13 +23,19 @@ Design notes (see CLAUDE.md's Design Decisions section for the short version):
 
 from __future__ import annotations
 
-from datetime import date, datetime, timedelta
+from datetime import date, datetime, time, timedelta
 from pathlib import Path
 
 import pandas as pd
 import yfinance as yf
 
+from engine.events import MarketEvent
+
 DEFAULT_CACHE_DIR = Path(__file__).parent / "cache"
+
+# Daily bars carry no intraday timestamp; 9:30 stands in for "market open",
+# matching the convention used throughout tests/ and the runner scripts.
+DEFAULT_BAR_TIME = time(9, 30)
 
 SCHEMA_COLUMNS = ["date", "open", "high", "low", "close", "volume", "symbol"]
 
@@ -76,6 +82,38 @@ def _validate_schema(df: pd.DataFrame) -> None:
         )
 
 
+# yfinance's auto_adjust split/dividend adjustment occasionally leaves open
+# or close a hair outside [low, high] -- observed directly while building
+# Step 5's multi-symbol backtest: e.g. ADP on 2018-10-30 came back with
+# close=115.84330749511719 against high=115.84330749511717 (a ~2e-14 ULP
+# gap), and other symbols/dates were off by as much as ~7.6e-6 (still a
+# fraction of a cent). This is floating-point noise in the adjustment
+# arithmetic, not a real OHLC inconsistency, and it was even observed to
+# vary between separate fetches of the identical [symbol, date] pair.
+# MarketEvent.__post_init__ is deliberately strict and rejects it outright
+# (see CLAUDE.md's no-look-ahead/fail-loud philosophy) -- correctly, since
+# it can't tell noise from a real data problem on its own. This clamps
+# values back onto the boundary only when the gap is well within this
+# tolerance; anything larger is left untouched and will still raise, since
+# that's a real problem worth seeing, not noise to hide.
+_OHLC_NOISE_TOLERANCE = 0.01  # dollars; ~1000x the largest gap seen so far
+
+
+def _clamp_adjustment_noise(df: pd.DataFrame) -> pd.DataFrame:
+    df = df.copy()
+    tol = _OHLC_NOISE_TOLERANCE
+    for edge_col, bound_col, above in (
+        ("close", "high", True), ("close", "low", False),
+        ("open", "high", True), ("open", "low", False),
+    ):
+        if above:
+            mask = (df[edge_col] > df[bound_col]) & (df[edge_col] - df[bound_col] <= tol)
+        else:
+            mask = (df[edge_col] < df[bound_col]) & (df[bound_col] - df[edge_col] <= tol)
+        df.loc[mask, edge_col] = df.loc[mask, bound_col]
+    return df
+
+
 def fetch_ohlcv(symbol: str, start: date, end: date) -> pd.DataFrame:
     """Fetch raw OHLCV from yfinance and normalize it to the engine's schema.
 
@@ -104,6 +142,7 @@ def fetch_ohlcv(symbol: str, start: date, end: date) -> pd.DataFrame:
     df["date"] = pd.to_datetime(df["date"]).dt.date
     df["symbol"] = symbol
     df = df[SCHEMA_COLUMNS]
+    df = _clamp_adjustment_noise(df)
     return df.sort_values("date").reset_index(drop=True)
 
 
@@ -153,3 +192,32 @@ def load_ohlcv(
     result = merged.loc[mask].reset_index(drop=True)
     _validate_schema(result)
     return result
+
+
+def load_market_events(
+    symbol: str,
+    start: DateLike,
+    end: DateLike,
+    bar_time: time = DEFAULT_BAR_TIME,
+    cache_dir: Path = DEFAULT_CACHE_DIR,
+) -> list[MarketEvent]:
+    """load_ohlcv, converted to MarketEvents ready for the event queue.
+
+    Kept alongside load_ohlcv (rather than in a runner script) so every
+    caller that needs an OHLCV DataFrame turned into a MarketEvent stream
+    -- main.py, compare_survivorship.py, or any future one -- shares this
+    one conversion instead of reimplementing the row-by-row loop.
+    """
+    df = load_ohlcv(symbol, start, end, cache_dir=cache_dir)
+    return [
+        MarketEvent(
+            timestamp=datetime.combine(row.date, bar_time),
+            symbol=row.symbol,
+            open=float(row.open),
+            high=float(row.high),
+            low=float(row.low),
+            close=float(row.close),
+            volume=int(row.volume),
+        )
+        for row in df.itertuples(index=False)
+    ]

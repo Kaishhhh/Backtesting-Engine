@@ -38,6 +38,7 @@ FillEvent    → Portfolio updates cash/positions
 ├── validation/
 │   └── walk_forward.py   # walk-forward train/test harness
 ├── main.py                # end-to-end run: real data through the pipeline
+├── compare_survivorship.py  # survivorship-bias tearsheet comparison
 └── tests/                 # unit tests for every module above
 ```
 
@@ -48,7 +49,8 @@ python -m venv .venv
 pip install -e ".[dev]"
 pytest
 
-python main.py  # runs the SMA crossover strategy on AAPL, 2015-2024
+python main.py                  # runs the SMA crossover strategy on AAPL, 2015-2024
+python compare_survivorship.py  # survivorship-bias tearsheet comparison
 
 
 ## Build order / status
@@ -64,8 +66,9 @@ on — each stage below was its own commit.
       slippage/commission simulation, next-bar-open fills
 - [x] **4. First strategy (SMA crossover)** — validates the full pipeline
       end-to-end on real data
-- [ ] **5. Performance analytics** — Sharpe, Sortino, drawdown, tearsheet;
+- [x] **5. Performance analytics** — Sharpe, Sortino, drawdown, tearsheet;
       also where the survivorship-bias toggle gets demonstrated side-by-side
+      (`compare_survivorship.py`)
 - [ ] **6. Second strategy** — proves the engine generalizes beyond one
       strategy's assumptions
 - [ ] **7. Walk-forward validation** — rolling train/test splits instead of
@@ -117,6 +120,19 @@ backtester that are easy to get subtly wrong:
   also withholds a signal on the very bar its window first becomes full,
   since that bar only establishes a baseline state, not an observed
   crossover.
+- **Survivorship bias, demonstrated with a real result, not just a
+  toggle.** `compare_survivorship.py` runs the same strategy across a
+  curated pool of real 2015 S&P 500 constituents, once restricted to the
+  accurate point-in-time membership and once to today's roster. On the
+  real data: the biased (today's-roster) universe shows +88.89% total
+  return vs. the accurate universe's +50.13% — excluding the names that
+  later left the index measurably inflates the biased backtest's apparent
+  performance.
+- **Round-trip win/loss is real FIFO lot-matching, not a fill-count
+  heuristic.** `analytics/performance.py`'s `extract_round_trips()` matches
+  each SELL against the oldest open BUY lot(s) per symbol, splitting across
+  partial fills — replacing an earlier naive `len(trade_log) // 2` estimate
+  that didn't actually look at trade contents.
 
 ## ⚠️ Data sources and known limitations
 
