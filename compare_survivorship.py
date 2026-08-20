@@ -23,11 +23,24 @@ availability over 2015-01-01..2024-12-31 before being chosen:
   - 8 names that were 2015 constituents but are NOT in today's roster:
     BBBY, CAG, GT, MAT, UNM, XRAY have full 2015-2024 data (still-trading
     companies that simply fell out of the index -- BBBY's history includes
-    its real 2023 bankruptcy, a genuine survivorship-bias example). TWX and
-    COL are kept in deliberately even though their data stops mid-backtest
-    (acquired by AT&T in 2018 and UTC in 2020, respectively) specifically
-    to exercise -- and document -- correct handling of a constituent whose
-    data runs out before the backtest's end date (see _aggregate_curves).
+    its real 2023 bankruptcy, a genuine survivorship-bias example). TWX is
+    kept in deliberately even though its data stops mid-backtest (acquired
+    by AT&T, closed 2018-06-14) specifically to exercise -- and document --
+    correct handling of a constituent whose data runs out before the
+    backtest's end date (see _aggregate_curves). M (Macy's, still trading)
+    fills the 8th slot as of the fix below.
+
+  POST-STEP-6 FIX: this pool originally used COL (Rockwell Collins) in
+  TWX's slot. It was replaced with M after discovering yfinance's `COL`
+  ticker does not actually return Rockwell Collins data -- its price
+  series ($0.05-$0.75, 2015-2020) doesn't match the real company (which
+  traded $92-$141 before its Nov 2018 UTC acquisition) and never stops
+  trading at the real delisting date. Confirmed as a genuine data bug, not
+  a false alarm, by checking it against TWX: TWX's yfinance metadata looks
+  equally suspicious (quoteType MUTUALFUND) but its actual price series
+  and delisting date both check out as real Time Warner data, so the two
+  cases needed to be verified independently rather than assumed identical.
+  Full investigation and before/after tearsheet numbers in CLAUDE.md.
 
 Not a claim that this pool is representative of the whole index's
 survivorship effect -- it's sized for a fast, reproducible demo with real,
@@ -36,6 +49,8 @@ documented for data/universe.py itself in CLAUDE.md.
 """
 
 from __future__ import annotations
+
+from typing import Callable
 
 import pandas as pd
 
@@ -46,6 +61,7 @@ from engine.events import FillEvent
 from engine.execution import ExecutionHandler
 from engine.portfolio import Portfolio, PortfolioError, PortfolioSnapshot
 from engine.runner import run_backtest
+from strategies.base import Strategy
 from strategies.sma_crossover import SMACrossoverStrategy
 
 AS_OF = "2015-01-01"
@@ -54,19 +70,31 @@ FAST_WINDOW = 20
 SLOW_WINDOW = 50
 INITIAL_CASH = 100_000.0
 
+# Default strategy_factory/label for this module's own SMA comparison.
+# strategies/rsi_mean_reversion.py reuses main() below (via
+# compare_survivorship_rsi.py) by passing its own factory/label instead --
+# see that script and CLAUDE.md's Step 6 design decisions for why this was
+# parameterized rather than duplicated.
+_DEFAULT_STRATEGY_FACTORY: Callable[[], Strategy] = lambda: SMACrossoverStrategy(
+    fast_window=FAST_WINDOW, slow_window=SLOW_WINDOW
+)
+_DEFAULT_LABEL = f"SMA({FAST_WINDOW}, {SLOW_WINDOW}) crossover"
+
 CANDIDATE_POOL = frozenset(
     {
         # Survived to today (in both the 2015 point-in-time and current universe).
         "AAPL", "ABT", "ACN", "ADBE", "ADP", "AMGN", "AMZN", "AON", "APD", "ADM", "AMAT", "AIG",
         # 2015 constituents dropped from today's roster.
-        "BBBY", "CAG", "GT", "MAT", "UNM", "XRAY", "TWX", "COL",
+        "BBBY", "CAG", "GT", "MAT", "UNM", "XRAY", "TWX", "M",
     }
 )
 
 
-def _run_one(symbol: str, cash: float) -> tuple[list[PortfolioSnapshot], list[FillEvent]]:
+def _run_one(
+    symbol: str, cash: float, strategy_factory: Callable[[], Strategy]
+) -> tuple[list[PortfolioSnapshot], list[FillEvent]]:
     bars = load_market_events(symbol, AS_OF, END)
-    strategy = SMACrossoverStrategy(fast_window=FAST_WINDOW, slow_window=SLOW_WINDOW)
+    strategy = strategy_factory()
     portfolio = Portfolio(initial_cash=cash)
     execution = ExecutionHandler()
     try:
@@ -137,19 +165,24 @@ def _aggregate_curves(curves: dict[str, list[PortfolioSnapshot]]) -> list[Portfo
     ]
 
 
-def run_universe_backtest(symbols: list[str]) -> tuple[list[PortfolioSnapshot], list[FillEvent]]:
+def run_universe_backtest(
+    symbols: list[str], strategy_factory: Callable[[], Strategy]
+) -> tuple[list[PortfolioSnapshot], list[FillEvent]]:
     per_symbol_cash = INITIAL_CASH / len(symbols)
     curves: dict[str, list[PortfolioSnapshot]] = {}
     all_trades: list[FillEvent] = []
     for symbol in symbols:
-        curve, trades = _run_one(symbol, per_symbol_cash)
+        curve, trades = _run_one(symbol, per_symbol_cash, strategy_factory)
         curves[symbol] = curve
         all_trades.extend(trades)
     all_trades.sort(key=lambda fill: fill.timestamp)
     return _aggregate_curves(curves), all_trades
 
 
-def main() -> None:
+def main(
+    strategy_factory: Callable[[], Strategy] = _DEFAULT_STRATEGY_FACTORY,
+    label: str = _DEFAULT_LABEL,
+) -> None:
     accurate_members = get_universe(AS_OF, survivorship_biased=False)
     biased_members = get_universe(AS_OF, survivorship_biased=True)
     accurate_symbols = sorted(CANDIDATE_POOL & accurate_members)
@@ -158,6 +191,7 @@ def main() -> None:
 
     print("Survivorship bias comparison")
     print("=============================")
+    print(f"Strategy:                     {label}")
     print(f"As of:                        {AS_OF}")
     print(f"Candidate pool:               {len(CANDIDATE_POOL)} tickers (see module docstring)")
     print(f"Accurate (point-in-time) universe: {len(accurate_symbols)} names -> {accurate_symbols}")
@@ -165,8 +199,8 @@ def main() -> None:
     print(f"Silently dropped by the biased view: {dropped}")
     print()
 
-    accurate_curve, accurate_trades = run_universe_backtest(accurate_symbols)
-    biased_curve, biased_trades = run_universe_backtest(biased_symbols)
+    accurate_curve, accurate_trades = run_universe_backtest(accurate_symbols, strategy_factory)
+    biased_curve, biased_trades = run_universe_backtest(biased_symbols, strategy_factory)
 
     accurate_sheet = generate_tearsheet(accurate_curve, accurate_trades)
     biased_sheet = generate_tearsheet(biased_curve, biased_trades)

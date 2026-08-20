@@ -352,7 +352,185 @@ data/reference/SOURCES.md for the full point-in-time data writeup)_
   (AS_OF=2015-01-01, same SMA(20,50)/$100k as `main.py`): accurate universe
   +50.13% (CAGR 4.15%, Sharpe 0.44, max drawdown -18.20%) vs. biased
   universe +88.89% (CAGR 6.57%, Sharpe 0.60, max drawdown -21.08%) — see
-  chat history for full side-by-side tearsheets.
+  chat history for full side-by-side tearsheets. **These `compare_survivorship.py`
+  figures were later found to rest on bad data for one pool member (`COL`)
+  and were corrected post-Step-6 — see "COL data-quality bug, found and
+  fixed" below for the root cause and the corrected numbers. Left
+  unedited here rather than silently rewritten, so the record shows what
+  was originally reported and why it changed.**
+
+### Step 6 — Second strategy (RSI mean-reversion)
+- **Strategy choice: RSI mean-reversion, proposed and confirmed with the
+  user before writing any code, per their explicit request.** Presented
+  three options — RSI mean-reversion, N-day momentum/ROC, and Donchian
+  channel breakout — and picked mean-reversion because it is a genuinely
+  different *bet* from SMA crossover (reversion vs. trend continuation),
+  not just different parameters on the same trend-following idea; the
+  other two candidates were both still trend-following in spirit. User
+  confirmed this choice via explicit sign-off before implementation began.
+- **Cutler's (simple-average) RSI, not Wilder's smoothed RSI.**
+  `RSIMeanReversionStrategy` computes average gain/loss as a plain mean
+  over the trailing `period` bar-over-bar changes, recomputed fresh from a
+  `deque(maxlen=period + 1)` every bar — deliberately not Wilder's
+  exponential smoothing, which would make the indicator depend on the
+  strategy's entire history since inception rather than just its current
+  window. Cutler's variant is a standard, documented RSI alternative, not
+  an invented simplification, and it keeps the same "fixed rolling window,
+  no stored history" discipline `SMACrossoverStrategy` established in Step
+  4 — the actual point of this step, proving `strategies/base.py`'s
+  one-bar-at-a-time interface generalizes to a second, differently-shaped
+  indicator.
+- **Zone-based crossing detection (`"low"`/`"mid"`/`"high"`), not two
+  independent boolean flags.** RSI < 30 → LONG (entering oversold), RSI >
+  70 → EXIT (entering overbought); 30–70 inclusive is neutral. A signal
+  fires only on a *transition into* an extreme zone (mirroring SMA
+  crossover's "only on an observed crossing" rule) — leaving one extreme
+  and landing in the neutral zone without reaching the opposite extreme
+  emits nothing, since the reversion (or its exit) hasn't actually
+  happened yet. Boundary values (RSI exactly 30 or 70) count as neutral,
+  the same tie-goes-to-"not triggered" convention SMA crossover uses. No
+  signal on the bar the window first becomes full, for the same reason as
+  Step 4: that bar only establishes a baseline zone, not an observed
+  crossing.
+- **`compare_survivorship.py` parameterized (`strategy_factory` + `label`
+  arguments on `main()`/`_run_one()`/`run_universe_backtest()`), not
+  duplicated — flagged to the user before making the change, per their
+  explicit request (same as the Step 5 survivorship-gap flag).** Presented
+  two options: parameterize the existing script with a thin new
+  `compare_survivorship_rsi.py` entry point reusing its aggregation/
+  forward-fill/error-handling logic, or fork the whole ~150-line script.
+  User picked parameterizing. `python compare_survivorship.py` with no
+  arguments is unchanged (defaults to the original SMA crossover
+  factory/label); `compare_survivorship_rsi.py` imports `main` and passes
+  an `RSIMeanReversionStrategy` factory instead. `engine/` and
+  `data/universe.py` were untouched.
+- **Validation runs**: `main_rsi.py` (AAPL, 2015-2024, RSI(14) 30/70,
+  $100,000, same range/cash as `main.py`) ends at $158,718.09 (+58.72%,
+  CAGR 4.73%, Sharpe 0.33, max drawdown -29.94%, 29 round trips, 72.4% win
+  rate) — a real, un-cherry-picked run, not tuned for this result.
+  `compare_survivorship_rsi.py` (same 20-ticker pool as the SMA version):
+  accurate universe +79.08% (CAGR 6.00%, Sharpe 0.56) vs. biased universe
+  +124.04% (CAGR 8.40%, Sharpe 0.67) — the survivorship-bias effect
+  reproduces with a second, differently-behaved strategy (519 round trips
+  vs. the SMA run's much lower turnover), not just SMA crossover
+  specifically. **`main_rsi.py`'s single-symbol AAPL numbers are unaffected
+  and stand as final — it never touches `CANDIDATE_POOL`. The
+  `compare_survivorship_rsi.py` pool figures above rested on the same bad
+  `COL` data described below and were corrected afterward; see "COL
+  data-quality bug, found and fixed."**
+- **Found in this step, fixed in a dedicated follow-up pass immediately
+  after: `COL`'s data in the `CANDIDATE_POOL` was not Rockwell Collins.**
+  Discovered because this step's RSI run hit a `PortfolioError` on `COL`
+  (a BUY sized at 93,540 shares against a $0.055 price) that looked too
+  extreme to be the documented "overnight gap exceeds sizing headroom"
+  case (`MAT`'s same-run error is that case — its price series is a
+  plausible real Mattel history). Originally flagged here as found-but-
+  not-fixed, since the `CANDIDATE_POOL` and its data were Step 5's scope
+  and swapping/removing `COL` would change a result already documented as
+  final. The user asked for a dedicated investigation and fix before
+  moving on to Step 7; that follow-up is recorded below rather than
+  silently folded into this bullet, so the record shows a bug existed and
+  was then fixed, not that the numbers were quietly correct all along.
+
+#### Post-Step-6 fix: COL data-quality bug, found and fixed
+- **Root cause, confirmed against an external reference.** Real Rockwell
+  Collins traded $92.76 (start of 2017) rising to $141.63 (Nov 2018, on
+  China's regulatory approval of the United Technologies acquisition),
+  delisted 2018-11-26 (deal terms: $93.33 cash + $46.67 in UTX stock per
+  share, ~$30B total). `yfinance`'s `COL` series instead ranges
+  $0.05–$0.75 for the *entire* 2015–2020 window and keeps trading years
+  past the real delisting date; `yf.Ticker('COL').info` returns
+  `quoteType=MUTUALFUND`, `shortName='789776'`, `exchange='YHD'` —
+  garbage/placeholder metadata consistent with Yahoo having reassigned
+  the `COL` symbol to an unrelated, effectively-defunct instrument after
+  the real Rockwell Collins delisted.
+- **Ruled out a false alarm by checking `TWX` the same way, since it
+  shares the same suspicious metadata.** `TWX` also reports
+  `quoteType=MUTUALFUND` with an equally garbled `shortName`/`exchange` —
+  if metadata alone were the signal, `TWX` would look just as broken as
+  `COL`. But `TWX`'s actual price *series* is legitimate real Time Warner
+  data: ~$80 in Jan 2015 rising to ~$99, and trading stops exactly at
+  2018-06-14/15, matching the real AT&T acquisition close date. Confirms
+  `yfinance`'s per-symbol `.info` metadata is not trustworthy for this
+  kind of check (it's stale/wrong for both tickers) but the actual OHLCV
+  *history* can still be correct even when the metadata is garbage —
+  each symbol had to be verified independently by its price series and
+  known real-world facts, not by a shared metadata flag.
+- **What `MarketEvent.__post_init__` catches vs. does not, and why this
+  slipped through it.** Its four checks (`high >= low`; `open`/`close`
+  each inside `[low, high]`; `volume >= 0`) validate *intra-bar*
+  structural consistency only — is this one bar internally coherent. They
+  have no concept of cross-bar continuity, price-magnitude plausibility,
+  or data provenance (is this even the right instrument). A bar for the
+  wrong security entirely is still a perfectly self-consistent OHLC bar,
+  so it passes by construction — the validator's job was never "is this
+  data correct," only "is this data internally sane," and those are
+  different questions. Notably, a **day-over-day discontinuity check**
+  specifically would **not** have caught this: `COL`'s bad series declines
+  *smoothly* from $0.70 to $0.05 over four years, with no single sharp
+  jump to flag.
+- **Fix chosen and applied, after presenting options for sign-off:**
+  1. `data/loader.py`: `fetch_ohlcv` now calls `_warn_if_implausibly_low`,
+     which emits a `warnings.warn` (not a hard `LoaderError`) if a
+     symbol's fetched closes never exceed `_MIN_PLAUSIBLE_PRICE = $1.00`
+     over the requested range. Warn, not raise, matching
+     `data/universe.py`'s existing precedent of warning rather than
+     hard-failing on a data-*plausibility* concern (as opposed to a
+     provable structural invariant, which does hard-fail elsewhere in
+     this codebase). Deliberately narrow and cheap, tuned to this
+     project's actual use case (S&P 500 large/mid-cap constituents) —
+     not a general data-quality engine, and it would not catch a
+     wrong-ticker bug that happens to map to another liquid,
+     normally-priced stock. Verified: fires for `COL`, silent for `AAPL`
+     and `M`.
+  2. `compare_survivorship.py`: `CANDIDATE_POOL` swaps `COL` for `M`
+     (Macy's) — verified `quoteType=EQUITY`, real price range
+     $3.65–$45.36 across the full 2015–2024 range, a genuine 2015 S&P 500
+     constituent (per `data/universe.py`'s vendored snapshot) later
+     dropped from today's roster, not already used elsewhere in the pool
+     or on the documented no-data list (`CELG`/`CERN`/`BCR`/`AGN`/`DNB`/`RTN`/`MON`).
+     Pool stays at 20 names / 8 dropped-constituents, same structure as
+     before. The module docstring's own description of `COL` (previously
+     stated as "acquired by UTC in 2020") was also corrected to the real
+     date (Nov 2018) while touching this text.
+- **Corrected numbers, both scripts re-run end-to-end against the fixed
+  pool:**
+
+  | Run | Universe | Old (COL, bugged) | New (M, corrected) |
+  |---|---|---|---|
+  | SMA (`compare_survivorship.py`) | Accurate | +50.13% (CAGR 4.15%, Sharpe 0.44, DD -18.20%) | +52.71% (CAGR 4.33%, Sharpe 0.46, DD -18.98%) |
+  | SMA (`compare_survivorship.py`) | Biased | +88.89% (CAGR 6.57%, Sharpe 0.60, DD -21.08%) | +88.86% (CAGR 6.57%, Sharpe 0.60, DD -21.09%) |
+  | RSI (`compare_survivorship_rsi.py`) | Accurate | +79.08% (CAGR 6.00%, Sharpe 0.56) | +77.14% (CAGR 5.89%, Sharpe 0.54, DD -27.30%) |
+  | RSI (`compare_survivorship_rsi.py`) | Biased | +124.04% (CAGR 8.40%, Sharpe 0.67) | +124.03% (CAGR 8.40%, Sharpe 0.67) |
+
+  Biased-universe figures barely move (`COL`/`M` were never in that
+  universe — it's today's roster, and neither ticker is a current S&P 500
+  member — the small residual delta is the pre-existing run-to-run
+  caching/re-fetch noise already documented in Step 5). Accurate-universe
+  figures move more, since that's the universe `COL`/`M` actually
+  populate: SMA's accurate return rises (+50.13% → +52.71%, `COL`'s
+  near-worthless contribution before its early `PortfolioError` freeze
+  understated the aggregate); RSI's accurate return *falls* slightly
+  (+79.08% → +77.14%, since RSI traded `COL`'s degenerate series
+  differently than SMA did before erroring out — this direction change
+  is expected and not a sign of a new bug, just a different strategy
+  reacting differently to a full vs. partial replacement of one pool
+  member). The core finding survives the correction either way: the
+  biased universe still meaningfully outperforms the accurate one for
+  both strategies.
+- **`main.py` and `main_rsi.py` (single-symbol AAPL) are unaffected and
+  remain final as originally reported** — neither touches
+  `CANDIDATE_POOL` or `data/universe.py`.
+- **Not done as part of this fix**: a full re-verification of every other
+  `CANDIDATE_POOL` ticker's price history against an external reference.
+  `TWX` was checked (see above) and is fine; the other 12 "survived"
+  names and `BBBY`/`CAG`/`GT`/`MAT`/`UNM`/`XRAY` were not re-checked
+  beyond their original Step 5 "has full data" pass and the new loader
+  warning (which fired for none of them on this run). The loader's new
+  warning is a partial safety net going forward, not a substitute for
+  that full re-verification, which remains a worthwhile dedicated pass
+  later if the pool composition matters for something higher-stakes than
+  this demo.
 
 ## Current status
 _(update this section as the project progresses)_
@@ -361,5 +539,5 @@ _(update this section as the project progresses)_
 - [x] Portfolio + execution
 - [x] First strategy (SMA crossover) validating full pipeline
 - [x] Performance analytics
-- [ ] Second strategy
+- [x] Second strategy
 - [ ] Walk-forward validation

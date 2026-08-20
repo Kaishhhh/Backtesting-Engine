@@ -23,6 +23,7 @@ Design notes (see CLAUDE.md's Design Decisions section for the short version):
 
 from __future__ import annotations
 
+import warnings
 from datetime import date, datetime, time, timedelta
 from pathlib import Path
 
@@ -99,6 +100,35 @@ def _validate_schema(df: pd.DataFrame) -> None:
 _OHLC_NOISE_TOLERANCE = 0.01  # dollars; ~1000x the largest gap seen so far
 
 
+# A symbol whose price never exceeds this over the whole requested range
+# triggers a warning, not a hard failure -- see CLAUDE.md's writeup of the
+# COL incident (yfinance's `COL` ticker silently returns an unrelated,
+# effectively-defunct instrument instead of Rockwell Collins' real history:
+# $0.05-$0.75 for years, vs. the real company's $92-$141 range). This is a
+# narrow, cheap heuristic tuned to this project's actual use case --
+# S&P 500 large/mid-cap constituents via data/universe.py -- not a general
+# data-quality engine. It would NOT catch every bad-ticker case (e.g. one
+# that happens to map to another liquid, normally-priced stock), and a
+# day-over-day discontinuity check specifically would not have caught COL
+# either, since that series declined smoothly over years rather than
+# jumping. Warn rather than raise, matching data/universe.py's existing
+# precedent of warning (not hard-failing) on a data-plausibility concern
+# that isn't a provable structural invariant violation.
+_MIN_PLAUSIBLE_PRICE = 1.00  # dollars
+
+
+def _warn_if_implausibly_low(df: pd.DataFrame, symbol: str, start: date, end: date) -> None:
+    if df["close"].max() < _MIN_PLAUSIBLE_PRICE:
+        warnings.warn(
+            f"{symbol}: price never exceeds ${_MIN_PLAUSIBLE_PRICE:.2f} over "
+            f"[{start}, {end}] -- possible wrong-ticker/data-provenance issue "
+            f"(see the COL incident in CLAUDE.md); verify against an external "
+            f"source before trusting this data.",
+            UserWarning,
+            stacklevel=3,
+        )
+
+
 def _clamp_adjustment_noise(df: pd.DataFrame) -> pd.DataFrame:
     df = df.copy()
     tol = _OHLC_NOISE_TOLERANCE
@@ -143,6 +173,7 @@ def fetch_ohlcv(symbol: str, start: date, end: date) -> pd.DataFrame:
     df["symbol"] = symbol
     df = df[SCHEMA_COLUMNS]
     df = _clamp_adjustment_noise(df)
+    _warn_if_implausibly_low(df, symbol, start, end)
     return df.sort_values("date").reset_index(drop=True)
 
 

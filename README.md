@@ -31,15 +31,18 @@ FillEvent    → Portfolio updates cash/positions
 │   ├── execution.py     # fill simulation: slippage, commissions
 │   └── runner.py        # per-bar event-drain loop wiring it all together
 ├── strategies/
-│   ├── base.py           # abstract Strategy interface
-│   └── sma_crossover.py  # dual SMA crossover (Step 4 validation strategy)
+│   ├── base.py                  # abstract Strategy interface
+│   ├── sma_crossover.py         # dual SMA crossover (Step 4, trend-following)
+│   └── rsi_mean_reversion.py    # RSI mean-reversion (Step 6, mean-reversion)
 ├── analytics/
 │   └── performance.py    # Sharpe, Sortino, max drawdown, tearsheet
 ├── validation/
 │   └── walk_forward.py   # walk-forward train/test harness
-├── main.py                # end-to-end run: real data through the pipeline
-├── compare_survivorship.py  # survivorship-bias tearsheet comparison
-└── tests/                 # unit tests for every module above
+├── main.py                       # end-to-end run: SMA crossover on AAPL
+├── main_rsi.py                   # end-to-end run: RSI mean-reversion on AAPL
+├── compare_survivorship.py       # survivorship-bias comparison (SMA crossover)
+├── compare_survivorship_rsi.py   # same comparison, RSI mean-reversion
+└── tests/                        # unit tests for every module above
 ```
 
 ## Setup
@@ -49,8 +52,10 @@ python -m venv .venv
 pip install -e ".[dev]"
 pytest
 
-python main.py                  # runs the SMA crossover strategy on AAPL, 2015-2024
-python compare_survivorship.py  # survivorship-bias tearsheet comparison
+python main.py                      # SMA crossover strategy on AAPL, 2015-2024
+python main_rsi.py                  # RSI mean-reversion strategy on AAPL, 2015-2024
+python compare_survivorship.py      # survivorship-bias comparison, SMA crossover
+python compare_survivorship_rsi.py  # survivorship-bias comparison, RSI mean-reversion
 
 
 ## Build order / status
@@ -69,8 +74,10 @@ on — each stage below was its own commit.
 - [x] **5. Performance analytics** — Sharpe, Sortino, drawdown, tearsheet;
       also where the survivorship-bias toggle gets demonstrated side-by-side
       (`compare_survivorship.py`)
-- [ ] **6. Second strategy** — proves the engine generalizes beyond one
-      strategy's assumptions
+- [x] **6. Second strategy (RSI mean-reversion)** — conceptually opposite
+      bet from SMA crossover (reversion vs. trend-following), proves the
+      `Strategy` interface and `compare_survivorship.py`'s comparison
+      generalize beyond one strategy's assumptions
 - [ ] **7. Walk-forward validation** — rolling train/test splits instead of
       a single static backtest
 
@@ -124,10 +131,31 @@ backtester that are easy to get subtly wrong:
   toggle.** `compare_survivorship.py` runs the same strategy across a
   curated pool of real 2015 S&P 500 constituents, once restricted to the
   accurate point-in-time membership and once to today's roster. On the
-  real data: the biased (today's-roster) universe shows +88.89% total
-  return vs. the accurate universe's +50.13% — excluding the names that
+  real data: the biased (today's-roster) universe shows +88.86% total
+  return vs. the accurate universe's +52.71% — excluding the names that
   later left the index measurably inflates the biased backtest's apparent
   performance.
+- **A second, conceptually different strategy, not just different
+  parameters.** `RSIMeanReversionStrategy` bets the opposite direction from
+  SMA crossover — reversion instead of trend continuation — while reusing
+  the identical `Strategy` interface and rolling-window-state discipline.
+  `compare_survivorship.py`'s comparison logic was parameterized (a
+  `strategy_factory` callable) rather than duplicated so both strategies
+  share one aggregation/forward-fill implementation; `compare_survivorship_rsi.py`
+  just supplies a different factory. On the same 20-name pool: the biased
+  universe still outperforms the accurate one (+124.03% vs. +77.14% total
+  return), confirming the survivorship-bias effect isn't an artifact of one
+  particular strategy.
+- **A data bug found via this comparison, investigated, and fixed — not
+  silently corrected.** One pool member (`COL`) turned out to not
+  actually be Rockwell Collins in `yfinance`'s data (a $0.05–$0.75
+  penny-stock series, versus the real company's $80–140 range before its
+  2018 acquisition) — likely a reused/reassigned ticker symbol. Replaced
+  with `M` (Macy's, verified against real price history) and added a
+  cheap sanity check to `data/loader.py` that warns when a fetched
+  symbol's price never exceeds $1 across the requested range. The figures
+  above are the corrected numbers; full root-cause writeup and the
+  before/after comparison are in `CLAUDE.md`.
 - **Round-trip win/loss is real FIFO lot-matching, not a fill-count
   heuristic.** `analytics/performance.py`'s `extract_round_trips()` matches
   each SELL against the oldest open BUY lot(s) per symbol, splitting across
